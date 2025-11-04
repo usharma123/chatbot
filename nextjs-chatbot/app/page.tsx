@@ -21,10 +21,14 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Slider } from '@/components/ui/slider'
+import { Switch } from '@/components/ui/switch'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
-import { Send, Bot, User, Settings, Trash2, Copy, Check } from 'lucide-react'
+import { Send, Bot, User, Settings, Trash2, Copy, Check, Search, ExternalLink, ChevronDown } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import remarkMath from 'remark-math'
+import rehypeKatex from 'rehype-katex'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism'
 
@@ -92,10 +96,19 @@ const CodeBlock = ({ language, children }: { language: string; children: string 
   )
 }
 
+// Type definition for search source
+interface SearchSource {
+  title: string
+  url: string
+  summary: string
+  publishedDate?: string
+}
+
 // Type definition for chat messages
 interface Message {
   role: 'user' | 'assistant'
   content: string
+  sources?: SearchSource[]
 }
 
 // Available LLM models through OpenRouter
@@ -129,11 +142,49 @@ export default function ChatPage() {
   // State for sidebar visibility (settings panel)
   const [showSettings, setShowSettings] = useState(false)
   
+  // State for search toggle
+  const [searchEnabled, setSearchEnabled] = useState(false)
+  
   // Ref to scroll to bottom when new messages arrive
   const messagesEndRef = useRef<HTMLDivElement>(null)
   
   // Ref for the input field to maintain focus
   const inputRef = useRef<HTMLInputElement>(null)
+
+  /**
+   * Pre-process content to convert square bracket LaTeX notation to standard format
+   * Converts [ ... ] to $$...$$ if it contains LaTeX
+   */
+  const preprocessLatex = (content: string): string => {
+    // Normalize explicit TeX delimiters anywhere
+    let normalized = content
+      .replace(/\\\[([\s\S]*?)\\\]/g, (_m, inner) => `$$${String(inner).trim()}$$`)
+      .replace(/\\\(([\s\S]*?)\\\)/g, (_m, inner) => `$${String(inner).trim()}$`)
+
+    // Split by existing $$...$$ and $...$ to avoid altering math internals
+    const blocks = normalized.split(/(\$\$[\s\S]*?\$\$|\$[^$\n]+\$)/g)
+    const latexIndicators = /\\|frac|cdot|text|sqrt|sum|int|alpha|beta|gamma|delta|theta|pi|sigma|mu|lambda|omega|sin|cos|tan|log|exp|partial|nabla|leq|geq|neq|approx|equiv|rightarrow|leftarrow|infty|forall|exists|cup|cap|setminus|subset(eq)?|supset(eq)?|wedge|vee|oplus|otimes|pm|cdot|times|div|prod|lim|det|ker|dim|Re|Im|vec|hat|bar|boldsymbol/i
+
+    const transformed = blocks.map((seg) => {
+      // If this segment is already a $$ math block, keep unchanged
+      if (seg.startsWith('$$') && seg.endsWith('$$')) return seg
+      // Otherwise, transform cautiously
+      let s = seg
+      // [ ... ] not followed by (  => treat as math when LaTeX-like
+      s = s.replace(/\[([\s\S]+?)\](?!\()/g, (match, inner) => {
+        const trimmed = String(inner).trim()
+        return latexIndicators.test(trimmed) ? `$$${trimmed}$$` : match
+      })
+      // Bare LaTeX commands like \tan x or \sec^2 x → wrap as inline math
+      s = s.replace(/\\[A-Za-z]+[A-Za-z0-9^_{}\\\s]*?(?=(?:[.,;:!?)]|\s{2,}|$))/g, (match) => {
+        // Avoid wrapping if match already contains a $ (unlikely here) but be safe
+        return match.includes('$') ? match : `$${match.trim()}$`
+      })
+      return s
+    })
+
+    return transformed.join('')
+  }
 
   /**
    * Auto-scroll to bottom when new messages are added
@@ -144,12 +195,38 @@ export default function ChatPage() {
   }, [messages])
 
   /**
+   * Perform search using Exa AI
+   */
+  const performSearch = async (query: string): Promise<SearchSource[]> => {
+    try {
+      const response = await fetch('/api/search', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ query }),
+      })
+
+      if (!response.ok) {
+        throw new Error('Search failed')
+      }
+
+      const data = await response.json()
+      return data.results || []
+    } catch (error) {
+      console.error('Search error:', error)
+      return []
+    }
+  }
+
+  /**
    * Handle sending a message
    * 
    * This function:
    * 1. Adds the user message to the chat
-   * 2. Calls the API to get AI response with streaming
-   * 3. Updates the UI in real-time as chunks arrive
+   * 2. Performs search if enabled
+   * 3. Calls the API to get AI response with streaming
+   * 4. Updates the UI in real-time as chunks arrive
    */
   const handleSend = async () => {
     // Don't send empty messages
@@ -160,12 +237,34 @@ export default function ChatPage() {
     setInput('')
     setIsLoading(true)
 
-    // Add user message to chat history
-    const newMessages: Message[] = [...messages, { role: 'user', content: userMessage }]
-    setMessages(newMessages)
+    // Perform search if enabled
+    let searchSources: SearchSource[] = []
+    if (searchEnabled) {
+      searchSources = await performSearch(userMessage)
+    }
+
+    // Prepare messages with search context if available
+    // Keep user message clean in display, but add search context to API request
+    let messagesWithContext: Message[] = [...messages, { role: 'user', content: userMessage }]
+    
+    // If search is enabled and we have sources, add them to the context for API
+    if (searchEnabled && searchSources.length > 0) {
+      const searchContext = `\n\nSearch Results:\n${searchSources.map((source, idx) => 
+        `${idx + 1}. ${source.title} (${source.url})\n   ${source.summary}`
+      ).join('\n\n')}`
+      
+      // Add search context to the last user message for API (but don't display it)
+      messagesWithContext[messagesWithContext.length - 1] = {
+        ...messagesWithContext[messagesWithContext.length - 1],
+        content: userMessage + searchContext,
+      }
+    }
+
+    // Add user message to chat history (without search context for display)
+    setMessages([...messages, { role: 'user', content: userMessage }])
 
     // Add placeholder for assistant response (will be updated via streaming)
-    setMessages((prev) => [...prev, { role: 'assistant', content: '' }])
+    setMessages((prev) => [...prev, { role: 'assistant', content: '', sources: searchSources.length > 0 ? searchSources : undefined }])
 
     try {
       // Make API request to our Next.js API route
@@ -176,7 +275,7 @@ export default function ChatPage() {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          messages: newMessages, // Send all messages for context
+          messages: messagesWithContext, // Send all messages for context
           model: selectedModel,
           temperature: temperature[0],
         }),
@@ -225,12 +324,16 @@ export default function ChatPage() {
                   // Append new content to the assistant message
                   assistantMessage += content
                   
-                  // Update the last message in real-time
+                  // Update the last message in real-time (optimize by only updating content)
                   setMessages((prev) => {
                     const updated = [...prev]
-                    updated[updated.length - 1] = {
-                      role: 'assistant',
-                      content: assistantMessage,
+                    const lastMessage = updated[updated.length - 1]
+                    if (lastMessage && lastMessage.role === 'assistant') {
+                      // Only update content to avoid re-rendering sources unnecessarily
+                      updated[updated.length - 1] = {
+                        ...lastMessage,
+                        content: assistantMessage,
+                      }
                     }
                     return updated
                   })
@@ -242,15 +345,32 @@ export default function ChatPage() {
             }
           }
         }
+        
+        // Ensure sources are preserved after streaming completes
+        if (searchSources.length > 0) {
+          setMessages((prev) => {
+            const updated = [...prev]
+            const lastMessage = updated[updated.length - 1]
+            if (lastMessage && lastMessage.role === 'assistant') {
+              updated[updated.length - 1] = {
+                ...lastMessage,
+                sources: searchSources,
+              }
+            }
+            return updated
+          })
+        }
       }
     } catch (error) {
       // Handle errors by showing error message to user
       console.error('Error sending message:', error)
       setMessages((prev) => {
         const updated = [...prev]
+        const lastMessage = updated[updated.length - 1]
         updated[updated.length - 1] = {
           role: 'assistant',
           content: `❌ Error: ${error instanceof Error ? error.message : 'Unknown error occurred'}`,
+          sources: lastMessage?.sources, // Preserve sources even on error
         }
         return updated
       })
@@ -414,9 +534,10 @@ export default function ChatPage() {
                     {message.role === 'assistant' ? (
                       // Render markdown for assistant messages
                       // This allows the LLM to format responses with markdown (headers, lists, code blocks, etc.)
-                      <div className="max-w-none break-words">
+                      <div className="max-w-none break-words space-y-4">
                         <ReactMarkdown
-                          remarkPlugins={[remarkGfm]}
+                          remarkPlugins={[remarkGfm, [remarkMath, { singleDollarTextMath: true }]]}
+                          rehypePlugins={[rehypeKatex]}
                           components={{
                             // Custom styling for code blocks with syntax highlighting and copy button
                             code: ({ node, className, children, ...props }: any) => {
@@ -505,8 +626,50 @@ export default function ChatPage() {
                             ),
                           }}
                         >
-                          {message.content || (isLoading && index === messages.length - 1 ? '...' : '')}
+                          {preprocessLatex(message.content || (isLoading && index === messages.length - 1 ? '...' : ''))}
                         </ReactMarkdown>
+                        
+                        {/* Display sources if available - Collapsible */}
+                        {message.sources && message.sources.length > 0 && (
+                          <Collapsible defaultOpen={false} className="mt-4 pt-4 border-t border-border/50">
+                            <CollapsibleTrigger className="flex items-center gap-2 w-full hover:opacity-80 transition-opacity">
+                              <Search className="h-4 w-4 text-muted-foreground" />
+                              <h4 className="text-sm font-semibold text-muted-foreground">
+                                Sources ({message.sources.length})
+                              </h4>
+                              <ChevronDown className="h-4 w-4 text-muted-foreground transition-transform data-[state=open]:rotate-180" />
+                            </CollapsibleTrigger>
+                            <CollapsibleContent className="mt-3 space-y-2">
+                              {message.sources.map((source, idx) => (
+                                <a
+                                  key={idx}
+                                  href={source.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="block p-3 rounded-md bg-muted/50 hover:bg-muted border border-border/50 transition-colors group"
+                                >
+                                  <div className="flex items-start justify-between gap-2">
+                                    <div className="flex-1 min-w-0">
+                                      <div className="flex items-center gap-2 mb-1">
+                                        <span className="text-xs font-medium text-primary">{idx + 1}.</span>
+                                        <h5 className="text-sm font-medium truncate group-hover:text-primary transition-colors">
+                                          {source.title}
+                                        </h5>
+                                      </div>
+                                      <p className="text-xs text-muted-foreground line-clamp-2">
+                                        {source.summary}
+                                      </p>
+                                      <p className="text-xs text-muted-foreground/70 mt-1 truncate">
+                                        {source.url}
+                                      </p>
+                                    </div>
+                                    <ExternalLink className="h-4 w-4 text-muted-foreground flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity" />
+                                  </div>
+                                </a>
+                              ))}
+                            </CollapsibleContent>
+                          </Collapsible>
+                        )}
                       </div>
                     ) : (
                       // Plain text for user messages
@@ -535,6 +698,21 @@ export default function ChatPage() {
         {/* Input Area */}
         <div className="border-t border-border bg-card/50 backdrop-blur-sm">
           <div className="container mx-auto max-w-5xl px-6 py-4">
+            {/* Search Toggle */}
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2">
+                <Search className="h-4 w-4 text-muted-foreground" />
+                <label className="text-sm font-medium text-muted-foreground cursor-pointer" htmlFor="search-toggle">
+                  Web Search
+                </label>
+              </div>
+              <Switch
+                id="search-toggle"
+                checked={searchEnabled}
+                onCheckedChange={setSearchEnabled}
+              />
+            </div>
+            
             <div className="flex gap-2">
               <Input
                 ref={inputRef}
